@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Warming since 1980 — Map + Hover Line (historical → SSP5-8.5)</title>
+  <style>
+    :root{--fg:#111;--muted:#666;--grid:#e9ecef;--bg:#fff}
+    html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    .page{max-width:1100px;margin:24px auto;padding:0 16px}
+    h1{font-size:20px;margin:0 0 10px}
+    .sub{color:var(--muted);margin:0 0 18px}
+    .wrap{display:grid;grid-template-columns:460px 1fr;gap:16px;align-items:start;margin-top:4px}
+
+    .panel{border:1px solid #0002;border-radius:12px;padding:10px}
+    .controls{display:flex;gap:10px;align-items:center;margin:0}
+    .pill{border:1px solid #0002;background:#f8f9fa;padding:6px 10px;border-radius:999px}
+    .legend{display:flex;gap:8px;align-items:center}
+    .help{font-size:12px;color:#888;margin-top:6px}
+
+    .tooltip{position:absolute;pointer-events:none;background:#fff;border:1px solid #0002;padding:8px 10px;border-radius:6px;box-shadow:0 2px 8px #0002;font-size:12px;opacity:0}
+    .marker circle{stroke:#0007;stroke-width:1.25}
+    .marker text{font-size:11px;fill:#000a}
+    .x.grid line,.y.grid line{stroke:var(--grid)}
+    .axislabel{font-size:12px;fill:#666}
+
+    /* Range slider */
+    input[type="range"].range{
+      -webkit-appearance:none;appearance:none;width:100%;
+      height:6px;border-radius:999px;background:#e9ecef;outline:none;
+    }
+    input[type="range"].range::-webkit-slider-thumb{
+      -webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;
+      background:#111;box-shadow:0 2px 4px #0002;cursor:pointer;
+    }
+    input[type="range"].range::-moz-range-thumb{
+      width:16px;height:16px;border-radius:50%;background:#111;box-shadow:0 2px 4px #0002;cursor:pointer;border:none;
+    }
+    output.pill{
+      background:#111;color:#fff;border:none;padding:6px 10px;border-radius:999px;font-weight:600;letter-spacing:.2px;
+    }
+    .panel{position:relative}
+
+    /* Slider row ABOVE the map, centered, fixed height to match chart exactly */
+    .controls--top{
+      display:flex;justify-content:center;align-items:center;gap:10px;
+      height:28px;margin:0;
+    }
+    .controls--top .pill{padding:4px 8px}
+    .controls--top input[type="range"].range{width:clamp(200px,28vw,260px)}
+
+    /* Marker states */
+    .marker.locked circle{stroke:#000;stroke-width:2}
+    .marker.preview:not(.locked) circle{stroke:#000a;stroke-dasharray:2 2}
+  </style>
+</head>
+<body>
+<div class="page">
+  <h1>🔎 How much warmer does it get? A deep dive into our past, present, and future</h1>
+  <div class="sub">
+    In this visualization, we combine historical climate data (up to 2014) with SSP5-8.5 model projections for 2015 all the way to 2100, using the year 1980 as a baseline.
+  </div>
+  <div class="wrap">
+    <div class="panel">
+      <!-- Slider above the map and centered -->
+      <div class="controls controls--top">
+        <label class="pill">
+          <span class="label">Year</span>
+          <input id="year" class="range" type="range" min="1980" max="2100" value="2000" step="1">
+        </label>
+        <output id="yearLab" class="pill">2000</output>
+      </div>
+
+      <!-- Map: 392px so 28 (controls) + 392 = 420, matching the chart height -->
+      <svg id="map" width="460" height="392" viewBox="0 0 460 392" aria-label="World map with region markers"></svg>
+
+      <div id="legend" class="legend" style="margin-left:auto"></div>
+    </div>
+
+    <div class="panel">
+      <svg id="chart" width="560" height="420" viewBox="0 0 560 420" aria-label="Time series of warming since 1980"></svg>
+    </div>
+  </div>
+</div>
+
+<div id="tt" class="tooltip" role="tooltip"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3"></script>
+<script>
+(async function(){
+
+  // ---------- Load ----------
+  const rows = await d3.csv('../data/cmip6_tas_pr_regions.csv', d3.autoType);
+
+  const keep = rows.filter(d => {
+    const s = String(d.scenario||'').toLowerCase();
+    return s === 'historical' || s === 'ssp585';
+  });
+
+  // Prefer SSP585 when both present for a (region, year)
+  const byKey = d3.group(keep, d => `${d.region}|${d.year}`);
+  const stitched = [];
+  for (const [, arr] of byKey) {
+    const pick = arr.find(d => String(d.scenario).toLowerCase()==='ssp585') || arr[0];
+    stitched.push(pick);
+  }
+
+  let data = stitched.filter(d => d.year >= 1980 && d.year <= 2100);
+
+  // Rebase to 1980 per region
+  const seriesByRegionRaw = d3.group(data, d => d.region);
+  const rebased = [];
+  for (const [region, arr] of seriesByRegionRaw.entries()) {
+    const sorted = arr.slice().sort((a,b)=>d3.ascending(a.year,b.year));
+    const y1980 = sorted.find(d => d.year === 1980);
+    if (!y1980) continue;
+    const base = y1980.tas_anomaly;
+    for (const r of sorted) rebased.push({ region, year:r.year, since1980:r.tas_anomaly - base });
+  }
+  data = rebased;
+
+  const seriesByRegion = d3.group(data, d => d.region);
+  const years = d3.extent(data, d => d.year);
+
+  // Regions (ids must match CSV's "region" column)
+  const REGIONS = [
+    {id:'alaska',   name:'Alaska', lon:-150, lat:64},
+    {id:'ca_coast', name:'CA',     lon:-122, lat:37},
+    {id:'usa',      name:'USA',    lon:-98,  lat:39},
+    {id:'europe',   name:'Europe', lon:10,   lat:50},
+    {id:'global',   name:'Global', lon:0,    lat:0}
+  ];
+
+  // --- Interaction state ---
+  let lockedRegionId  = 'global'; // start locked on Global
+  let previewRegionId = null;
+  const currentRegionId = () => (lockedRegionId ?? previewRegionId);
+
+  // Map
+  const mapSvg = d3.select('#map');
+  const widthM = 460, heightM = 392;
+  const world = await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json').then(r=>r.json());
+  const land = topojson.feature(world, world.objects.countries);
+  const projection = d3.geoNaturalEarth1().fitExtent([[8,8],[widthM-8,heightM-8]], {type:"Sphere"});
+  const path = d3.geoPath(projection);
+  mapSvg.append('path').attr('d', path({type:'Sphere'})).attr('fill','#f1f3f5');  /* <-- fixed */
+  mapSvg.append('path').attr('d', path(land)).attr('fill','#dee2e6').attr('stroke','#adb5bd').attr('stroke-width',0.5); /* <-- fixed */
+
+  const vExtent = d3.extent(data, d => d.since1980);
+  const color = d3.scaleSequential(d3.interpolateRdYlBu).domain([vExtent[1], vExtent[0]]);
+  const radius = d3.scaleLinear().domain([0, Math.max(1.5, vExtent[1])]).range([5,10]);
+
+  const yearInput = document.getElementById('year');
+  const yearLab = document.getElementById('yearLab');
+  yearInput.min = Math.max(1980, years[0]);
+  yearInput.max = Math.min(2100, years[1]);
+  yearInput.value = Math.max(2000, +yearInput.min);
+  yearLab.textContent = yearInput.value;
+
+  const markers = mapSvg.append('g').selectAll('.marker').data(REGIONS).join('g')
+    .attr('class','marker')
+    .attr('transform', d=>`translate(${projection([d.lon,d.lat])})`)
+    .on('mouseenter', (ev,d) => { previewRegionId = d.id; renderSelected(ev); updateMarkerStyles(); })
+    .on('mousemove',  (ev,d) => { previewRegionId = d.id; renderSelected(ev); updateMarkerStyles(); })
+    .on('mouseleave', () => { previewRegionId = null; renderSelected(); updateMarkerStyles(); d3.select('#tt').style('opacity',0); })
+    .on('click',      (ev,d) => { lockedRegionId = (lockedRegionId === d.id) ? null : d.id; renderSelected(ev); updateMarkerStyles(); });
+
+  markers.append('circle').attr('r',6).attr('fill','#4dabf7');
+  markers.append('text').attr('y',-10).attr('text-anchor','middle').text(d=>d.name);
+
+  // Click empty map area to clear lock
+  mapSvg.on('click', (ev) => {
+    if (ev.target === mapSvg.node()) {
+      lockedRegionId = null;
+      renderSelected();
+      updateMarkerStyles();
+    }
+  });
+  // Esc to clear lock
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      lockedRegionId = null;
+      renderSelected();
+      updateMarkerStyles();
+    }
+  });
+
+  // Legend
+  const defs = mapSvg.append('defs');
+  const legendGradId = 'legendGrad';
+  const legendGrad = defs.append('linearGradient')
+    .attr('id', legendGradId).attr('x1','0%').attr('x2','100%').attr('y1','0%').attr('y2','0%');
+  legendGrad.selectAll('stop')
+    .data(d3.range(0,1.001,0.05))
+    .join('stop')
+    .attr('offset', d=>d)
+    .attr('stop-color', d=>{
+      const val = d3.interpolate(vExtent[0], vExtent[1])(d);
+      return color(val);
+    });
+
+  const L = {x: widthM - 172, y: heightM - 42, w: 140, h: 10};
+  const lg = mapSvg.append('g').attr('class','legend').attr('transform',`translate(${L.x},${L.y})`);
+  lg.append('text').attr('x',0).attr('y',-10).attr('font-size',11).attr('fill','#666').text('Warming since 1980 (°C)');
+  lg.append('rect').attr('x',0).attr('y',0).attr('width',L.w).attr('height',L.h).attr('fill',`url(#${legendGradId})`).attr('stroke','#0002');
+  lg.append('text').attr('x',0).attr('y',L.h+12).attr('font-size',10).attr('fill','#666').text('less');
+  lg.append('text').attr('x',L.w).attr('y',L.h+12).attr('text-anchor','end').attr('font-size',10).attr('fill','#666').text('more');
+  lg.append('text').attr('x',0).attr('y',L.h+24).attr('font-size',10).attr('fill','#888').text(vExtent[0].toFixed(1));
+  lg.append('text').attr('x',L.w).attr('y',L.h+24).attr('text-anchor','end').attr('font-size',10).attr('fill','#888').text(vExtent[1].toFixed(1));
+
+  // Chart
+  const chartSvg = d3.select('#chart');
+  const margin = {top:18,right:20,bottom:46,left:56};
+  const W = 560 - margin.left - margin.right;
+  const H = 420 - margin.top - margin.bottom;
+  const g = chartSvg.append('g').attr('transform',`translate(${margin.left},${margin.top})`);
+  const x = d3.scaleLinear().domain([+yearInput.min, +yearInput.max]).range([0,W]);
+  const y = d3.scaleLinear().range([H,0]);
+  const xAxis = d3.axisBottom(x).ticks(8).tickFormat(d3.format('d'));
+  const yAxis = d3.axisLeft(y);
+  g.append('g').attr('class','x grid').attr('transform',`translate(0,${H})`);
+  g.append('g').attr('class','y grid');
+  g.append('g').attr('class','x axis').attr('transform',`translate(0,${H})`).call(xAxis);
+  g.append('g').attr('class','y axis').call(yAxis);
+  g.append('text').attr('class','axislabel').attr('x', W/2).attr('y', H+34).attr('text-anchor','middle').text('Year');
+  g.append('text').attr('class','axislabel').attr('x', -H/2).attr('y', -40).attr('transform','rotate(-90)').attr('text-anchor','middle').text('Warming since 1980 (°C)');
+  const lineLayer = g.append('g');
+  const yearRule = g.append('line').attr('stroke','#0005');
+  const title = chartSvg.append('text').attr('x', margin.left).attr('y', 16).attr('font-size','14px');
+
+  // ---------- Fixed, top-centered annotations ----------
+ // ---------- Fixed, top-centered annotations ----------
+  const CURRENT_YEAR = new Date().getFullYear(); // viewer's clock
+  const STITCH_YEAR  = 2015;
+  const THRESH_VAL   = 1.5; // °C since 1980
+  const END_YEAR     = Math.min(2100, +yearInput.max); // usually 2100
+  // °C since 1980
+
+  const annoLayer = g.append('g').attr('class','anno-top').style('pointer-events','none');
+
+  // Callout tunables
+  const ANNO_MAX_W = 360;   // width cap so long text still fits
+  const PAD_X = 10;
+  const PAD_Y = 8;
+  const STACK_GAP = 8;       // gap between stacked callouts
+  const TOP_GAP = 6;         // space below the top margin inside the plot
+
+  const clamp = (v,min,max)=>Math.max(min,Math.min(max,v));
+
+  // word-wrap helper
+  function wrapText(textSel, maxWidth){
+    textSel.each(function() {
+      const text = d3.select(this);
+      const words = text.text().split(/\s+/).reverse();
+      let line = [], lineNumber = 0;
+      const x0 = +text.attr('x') || 0;
+      const y0 = +text.attr('y') || 0;
+      let tspan = text.text(null).append('tspan').attr('x',x0).attr('y',y0).attr('dy','0em');
+      let word;
+      while (word = words.pop()) {
+        line.push(word);
+        tspan.text(line.join(' '));
+        if (tspan.node().getComputedTextLength() > maxWidth) {
+          line.pop(); tspan.text(line.join(' '));
+          line = [word];
+          tspan = text.append('tspan')
+            .attr('x',x0).attr('y',y0)
+            .attr('dy', (++lineNumber * 1.2) + 'em')
+            .text(word);
+        }
+      }
+    });
+  }
+
+  // Draw one centered callout at y = cursorY; returns the used height (including padding)
+  function drawCenteredCallout(group, msg, cursorY){
+    const gBox = group.append('g').attr('opacity',0);
+
+    // text (measure + wrap)
+    const txt = gBox.append('text').attr('x',0).attr('y',0).attr('font-size',12).attr('fill','#111').attr('text-anchor','start').text(msg);
+    wrapText(txt, ANNO_MAX_W);
+    const bb = txt.node().getBBox();
+    const boxW = bb.width + PAD_X*2;
+    const boxH = bb.height + PAD_Y*2;
+
+    const cx = W/2;
+    const boxX = clamp(cx - boxW/2, 0, Math.max(0, W - boxW));
+    const boxY = clamp(cursorY, 0, Math.max(0, H - boxH));
+
+    // background
+    gBox.insert('rect','text')
+      .attr('x',boxX).attr('y',boxY)
+      .attr('rx',6).attr('ry',6)
+      .attr('width',boxW).attr('height',boxH)
+      .attr('fill','#fff').attr('stroke','#0002').attr('opacity',0.96);
+
+    // place text inside with padding (adjust for bbox y offset)
+    txt.attr('transform', `translate(${boxX + PAD_X}, ${boxY + PAD_Y - bb.y})`);
+
+    // fade in
+    gBox.transition().duration(150).attr('opacity',1);
+
+    return boxH;
+  }
+
+  // Precompute the +1.5°C crossing year per region (first year >= THRESH_VAL)
+  const threshYearByRegion = new Map();
+  for (const [region, arr] of seriesByRegion.entries()){
+    const sorted = arr.slice().sort((a,b)=>a.year-b.year);
+    const hit = sorted.find(d => d.since1980 >= THRESH_VAL);
+    if (hit) threshYearByRegion.set(region, hit.year);
+  }
+
+  function friendly(id){
+    const m = {alaska:'Alaska',ca_coast:'California Coast',usa:'USA',europe:'Europe',global:'Global'};
+    return m[id]||id;
+  }
+  function findRecord(regionId, yv){
+    const arr = seriesByRegion.get(regionId) || [];
+    return arr.find(r => r.year === +yv);
+  }
+
+  // Update all (stacked) top-centered annotations for a given year
+  function updateTopCenteredAnnotations(yNum){
+    annoLayer.selectAll('*').remove();
+
+    const msgs = [];
+    const regionId = currentRegionId();
+
+    // 1) Current-year
+    if (yNum === CURRENT_YEAR && regionId){
+      const rec = findRecord(regionId, yNum);
+      if (rec){
+        msgs.push(`you have reached the current year, where the temperature has gone up ${rec.since1980.toFixed(2)} degrees celsius since 1980`);
+      }
+    }
+
+    // 2) Stitch-year (2015)
+    if (yNum === STITCH_YEAR && regionId){
+      const rec = findRecord(regionId, yNum);
+      if (rec){
+        msgs.push('2015: transition from historical data to SSP5-8.5 projections');
+      }
+    }
+
+    // 3) Threshold (+1.5 °C since 1980) — first crossing year for the region
+    if (regionId){
+      const tYear = threshYearByRegion.get(regionId);
+      if (tYear != null && yNum === tYear){
+        msgs.push(`${friendly(regionId)} first crosses +${THRESH_VAL.toFixed(1)}°C (vs. 1980) in ${tYear}`);
+      }
+    }
+    if (yNum === END_YEAR && regionId){
+      const rec = findRecord(regionId, yNum);
+      if (rec){
+        msgs.push(`${END_YEAR}: warming reaches ${rec.since1980.toFixed(2)}°C (vs. 1980) under SSP5-8.5`);
+      }
+    }
+
+    // Render stacked
+    let cursorY = TOP_GAP; // distance from top inside the plot area
+    msgs.forEach(msg => {
+      const usedH = drawCenteredCallout(annoLayer, msg, cursorY);
+      cursorY += usedH + STACK_GAP;
+    });
+  }
+
+  // Marker visual + color/size by current year
+  function updateMarkersForYear(yNum){
+    markers.select('circle')
+      .attr('fill', d => {
+        const rec = findRecord(d.id, yNum);
+        const val = rec ? rec.since1980 : null;
+        return val == null ? '#adb5bd' : color(val);
+      })
+      .attr('opacity', d => findRecord(d.id, yNum) ? 1 : 0.6)
+      .attr('r', d => {
+        const rec = findRecord(d.id, yNum);
+        const val = rec ? Math.abs(rec.since1980) : 0;
+        return radius(val);
+      });
+  }
+
+  function updateMarkerStyles(){
+    markers
+      .classed('locked', d => lockedRegionId === d.id)
+      .classed('preview', d => previewRegionId === d.id);
+  }
+
+  function setYear(yv){
+    const yNum = +yv;
+    yearLab.textContent = yNum;
+    updateMarkersForYear(yNum);
+    yearRule.attr('x1', x(yNum)).attr('x2', x(yNum)).attr('y1',0).attr('y2',H);
+
+    // Ensure the y-scale & line match the active region before annotations
+    renderSelected();
+
+    // Top-centered annotations
+    updateTopCenteredAnnotations(yNum);
+  }
+
+  function renderSelected(ev){
+    const regionId = currentRegionId();
+    const tt = d3.select('#tt');
+
+    if (!regionId){
+      lineLayer.selectAll('path').remove();
+      title.text('Hover a region marker to see its history');
+      tt.style('opacity',0);
+      updateTopCenteredAnnotations(+yearInput.value);
+      return;
+    }
+
+    const arr = (seriesByRegion.get(regionId)||[]).slice().sort((a,b)=>d3.ascending(a.year,b.year));
+    if (!arr.length){
+      lineLayer.selectAll('path').remove();
+      title.text(friendly(regionId)+' — (no data)');
+      tt.style('opacity',0);
+      updateTopCenteredAnnotations(+yearInput.value);
+      return;
+    }
+
+    const yDom = d3.extent(arr, d=>d.since1980);
+    const pad = (yDom[1]-yDom[0]||1)*0.08; y.domain([yDom[0]-pad, yDom[1]+pad]).nice();
+    g.select('.y.axis').call(yAxis);
+    g.select('.x.grid').call(d3.axisBottom(x).tickSize(-H).tickFormat(''));
+    g.select('.y.grid').call(d3.axisLeft(y).tickSize(-W).tickFormat(''));
+
+    const line = d3.line().x(d=>x(d.year)).y(d=>y(d.since1980));
+    lineLayer.selectAll('path').data([arr]).join('path')
+      .attr('fill','none').attr('stroke','#d9480f').attr('stroke-width',2).attr('d', line);
+
+    const yv = +yearInput.value;
+    const atYear = arr.find(d => d.year === yv);
+    const txt = atYear ? `Year ${yv}: +${atYear.since1980.toFixed(2)}°C since 1980` : `Year ${yv}: (no value)`;
+    title.text(friendly(regionId) + ' — Warming since 1980 (°C)');
+
+    if (ev){
+      tt.html(`<strong>${friendly(regionId)}</strong><br/>${txt}`)
+        .style('opacity',1)
+        .style('left', (ev.pageX+10)+'px')
+        .style('top', (ev.pageY-10)+'px');
+    } else {
+      tt.style('opacity',0);
+    }
+
+    // Re-render top-centered annotations after y-domain updates
+    updateTopCenteredAnnotations(yv);
+  }
+
+  // Slider
+  document.getElementById('year').addEventListener('input', e=>{ setYear(e.target.value); });
+
+  // init
+  updateMarkerStyles();
+  setYear(yearInput.value);
+
+})();
+</script>
+</body>
+</html>

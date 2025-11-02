@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Continent Temperature Change — Two-Year Compare</title>
+  <style>
+    :root{--fg:#111;--muted:#5f6b7a;--grid:#e9eef3;--card:#fff}
+    html,body{margin:0;padding:0;background:#fafbfc;color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    .page{max-width:1100px;margin:24px auto;padding:0 16px}
+    h1{font-size:22px;margin:0 0 6px}
+    .sub{color:var(--muted);margin:0 0 18px}
+
+    /* Two equal columns so borders align vertically */
+    .wrap{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+
+    .panel{background:var(--card);border:1px solid #0001;border-radius:14px;padding:12px;position:relative}
+
+    /* controls INSIDE the card, stacked + centered */
+    .controls{
+      display:flex; flex-direction:column; gap:10px;
+      align-items:center; justify-content:center;
+      margin:6px auto 8px; max-width:520px;
+    }
+    .pill{display:flex; gap:8px; align-items:center; font-weight:600; width:100%; justify-content:center}
+    .pill input[type="range"]{width:320px}
+
+    /* Make both SVGs fill panel width equally */
+    svg.resp{width:100%; height:430px; display:block}
+
+    /* Legend group sits inside the map SVG (bottom-right) */
+    .legend-row{display:flex;justify-content:flex-end;align-items:center;margin-top:8px}
+    .legend{display:inline-flex;gap:8px;align-items:center}
+
+    .tooltip{position:absolute;pointer-events:none;background:#fff;border:1px solid #0002;padding:8px 10px;border-radius:8px;box-shadow:0 6px 20px #0002;font-size:12px;opacity:0}
+
+    /* axes + grids */
+    .marker circle{stroke:#0007;stroke-width:1.25}
+    .marker text{font-size:11px;fill:#0b1220}
+    .x.grid line,.y.grid line{stroke:var(--grid)}
+    .axis path,.axis line{stroke:#9aa7b2;shape-rendering:crispEdges}
+    .axislabel{font-size:12px;fill:#666}
+
+    /* Range slider styling (from reference look) */
+    input[type="range"].range{
+      -webkit-appearance:none;appearance:none;width:100%;
+      height:6px;border-radius:999px;background:#e9ecef;outline:none;
+    }
+    input[type="range"].range::-webkit-slider-thumb{
+      -webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;
+      background:#111;box-shadow:0 2px 4px #0002;cursor:pointer;
+    }
+    input[type="range"].range::-moz-range-thumb{
+      width:16px;height:16px;border-radius:50%;background:#111;box-shadow:0 2px 4px #0002;cursor:pointer;border:none;
+    }
+    output.pill{
+      background:#111;color:#fff;border:none;padding:6px 10px;border-radius:999px;font-weight:600;letter-spacing:.2px;
+    }
+
+    /* Marker interaction states */
+    .marker.locked circle{stroke:#000;stroke-width:2}
+    .marker.preview:not(.locked) circle{stroke:#000a;stroke-dasharray:2 2}
+  </style>
+</head>
+<body>
+<div class="page">
+  <h1>🔎 How much warmer does it get? A deep dive into our past, present, and future</h1>
+  <p class="sub">In this visualization, we combine historical climate data (up to 2014) with SSP5-8.5 model projections for 2015 all the way to 2060.</p>
+
+  <div class="wrap">
+    <div class="panel" id="mapCard">
+      <!-- centered sliders inside the card (stacked) -->
+      <div class="controls">
+        <label class="pill">
+          <span>Baseline</span>
+          <input id="y0" class="range" type="range" min="1980" max="2060" value="1980" step="1" aria-label="Baseline year">
+          <output id="lab0" class="pill">1980</output>
+        </label>
+        <label class="pill">
+          <span>Compare</span>
+          <input id="y1" class="range" type="range" min="1981" max="2060" value="2060" step="1" aria-label="Comparison year">
+          <output id="lab1" class="pill">2060</output>
+        </label>
+      </div>
+
+      <svg id="map" class="resp" viewBox="0 0 520 430" preserveAspectRatio="xMidYMid meet" aria-label="World map with region markers"></svg>
+    </div>
+
+    <div class="panel">
+      <svg id="chart" class="resp" viewBox="0 0 520 430" preserveAspectRatio="xMidYMid meet" aria-label="Time series"></svg>
+    </div>
+  </div>
+</div>
+
+<div id="tt" class="tooltip" role="tooltip"></div>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3"></script>
+<script>
+(async function(){
+  // ---------- Data ----------
+  const rows = await d3.csv('../data/cmip6_continent_means.csv', d3.autoType);
+  const data = rows.filter(d => d.scenario === 'historical' || d.scenario === 'ssp585');
+
+  // Prefer SSP585 when both present, grouped by (continent, year)
+  function mergeScenario(rows){
+    const grouped = d3.group(rows, d=>d.continent, d=>d.year);
+    const out = new Map();
+    grouped.forEach((byYear, cont)=>{
+      const arr=[];
+      byYear.forEach((vals, yr)=>{
+        const pick = vals.find(v=>v.scenario==='ssp585') || vals[0];
+        if (pick && pick.tas_c != null) {
+          arr.push({continent: cont, year:+yr, tas_c:+pick.tas_c, scenario: pick.scenario});
+        }
+      });
+      arr.sort((a,b)=>a.year-b.year);
+      out.set(cont, arr);
+    });
+    return out;
+  }
+  const merged = mergeScenario(data);
+
+  const allYears = Array.from(merged.values()).flat().map(d=>d.year);
+  const globalMin = Math.max(1980, d3.min(allYears));
+  const globalMax = Math.min(2060, d3.max(allYears));
+
+  // Fixed marker positions for continents (no Antarctica)
+  const CONT_MARKERS = [
+    {id:'North America', lon:-100, lat:44, name:'North America'},
+    {id:'South America', lon:-60,  lat:-15, name:'South America'},
+    {id:'Europe',        lon: 10,  lat:50,  name:'Europe'},
+    {id:'Africa',        lon: 20,  lat: 5,  name:'Africa'},
+    {id:'Asia',          lon:100,  lat:35,  name:'Asia'},
+    {id:'Oceania',       lon:140,  lat:-25, name:'Oceania'}
+  ];
+
+  // ---------- Map ----------
+  const mapSvg = d3.select('#map');
+  const Wm=520, Hm=430;
+  const world = await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json').then(r=>r.json());
+  const land = topojson.feature(world, world.objects.countries);
+  const projection = d3.geoNaturalEarth1().fitExtent([[10,10],[Wm-10,Hm-10]], {type:'Sphere'});
+  const path = d3.geoPath(projection);
+
+  mapSvg.append('path').attr('d', path({type:'Sphere'})).attr('fill','#f1f3f5');   // reference look
+  mapSvg.append('path').attr('d', path(land)).attr('fill','#dee2e6').attr('stroke','#adb5bd').attr('stroke-width',0.5);
+
+  // Diverging color for delta (Compare - Baseline). We'll set domain dynamically per update.
+  const color = d3.scaleDiverging(d3.interpolateRdBu); // we'll set .domain([+D,0,-D]) in update()
+
+  // Radius grows with |delta| (to match color magnitude)
+  const radius = d3.scaleLinear().range([5,12]); // domain set in update()
+
+  // ---------- Chart ----------
+  const chartSvg = d3.select('#chart');
+  const margin = {top:18,right:18,bottom:42,left:56};
+  const W = 520 - margin.left - margin.right;
+  const H = 430 - margin.top - margin.bottom;
+  const g = chartSvg.append('g').attr('transform',`translate(${margin.left},${margin.top})`);
+  const x = d3.scaleLinear().domain([1980,2060]).range([0,W]);
+  const y = d3.scaleLinear().range([H,0]);
+  const xAxisG = g.append('g').attr('class','x axis').attr('transform',`translate(0,${H})`);
+  const yAxisG = g.append('g').attr('class','y axis');
+  const gridX = g.append('g').attr('class','x grid').attr('transform',`translate(0,${H})`);
+  const gridY = g.append('g').attr('class','y grid');
+  g.append('text').attr('class','axislabel').attr('x', W/2).attr('y', H+34).attr('text-anchor','middle').text('Year');
+  g.append('text').attr('class','axislabel').attr('x', -H/2).attr('y', -40).attr('transform','rotate(-90)').attr('text-anchor','middle').text('Temperature (°C)');
+  const lineLayer = g.append('g');
+  const yearRule = g.append('line').attr('stroke','#0005');
+  const title = chartSvg.append('text').attr('x', margin.left).attr('y', 16).attr('font-size','14px');
+
+  const tt = d3.select('#tt');
+
+  // ---------- Helpers ----------
+  function nearest(arr, year){
+    if (!arr || !arr.length) return null;
+    let best = arr[0], min = Infinity, Y=+year;
+    for (const d of arr){ const diff = Math.abs(d.year - Y); if(diff<min){min=diff; best=d;} }
+    return best;
+  }
+  function tempAt(continent, year){
+    const arr = merged.get(continent) || [];
+    const n = nearest(arr, year);
+    return n ? n.tas_c : null;
+  }
+
+  // ---------- Legend (SVG, dynamic) ----------
+  const defs = mapSvg.append('defs');
+  const LEG_ID = 'deltaLegend';
+  const grad = defs.append('linearGradient').attr('id', LEG_ID).attr('x1','0%').attr('x2','100%').attr('y1','0%').attr('y2','0%');
+  // we’ll update stops on each update()
+
+  const L = {x: Wm - 172, y: Hm - 50, w: 140, h: 10};
+  const lg = mapSvg.append('g').attr('class','legend').attr('transform',`translate(${L.x},${L.y})`);
+  lg.append('text').attr('x',0).attr('y',-12).attr('font-size',11).attr('fill','#666').text('Change in Temperature');
+  lg.append('rect').attr('x',0).attr('y',0).attr('width',L.w).attr('height',L.h).attr('fill',`url(#${LEG_ID})`).attr('stroke','#0002');
+  const lessLab = lg.append('text').attr('x',0).attr('y',L.h+12).attr('font-size',10).attr('fill','#666').text('cooler');
+  const moreLab = lg.append('text').attr('x',L.w).attr('y',L.h+12).attr('text-anchor','end').attr('font-size',10).attr('fill','#666').text('warmer');
+  const minLab = lg.append('text').attr('x',0).attr('y',L.h+24).attr('font-size',10).attr('fill','#888');
+  const maxLab = lg.append('text').attr('x',L.w).attr('y',L.h+24).attr('text-anchor','end').attr('font-size',10).attr('fill','#888');
+
+  function updateLegend(D){
+    // reset stops 0..1 with RdBu diverging mapped to [-D..+D]
+    const stops = d3.range(0,1.001,0.05);
+    grad.selectAll('stop').data(stops).join('stop')
+      .attr('offset', d=>d)
+      .attr('stop-color', d=>{
+        const v = d3.interpolate(-D, D)(d);
+        return color(v);
+      });
+    minLab.text((-D).toFixed(1));
+    maxLab.text((+D).toFixed(1));
+  }
+
+  // ---------- Interaction state (like reference) ----------
+  let lockedId = null;      // click to lock
+  let previewId = null;     // hover preview
+  const currentId = () => (lockedId ?? previewId);
+
+  // Markers
+  const markers = mapSvg.append('g').selectAll('.marker').data(CONT_MARKERS).join('g')
+    .attr('class','marker')
+    .attr('transform', d=>`translate(${projection([d.lon,d.lat])})`)
+    .on('mouseenter', (ev,d) => { previewId = d.id; renderSelected(ev); updateMarkerStates(); })
+    .on('mousemove',  (ev,d) => { previewId = d.id; renderSelected(ev); updateMarkerStates(); })
+    .on('mouseleave', () => { previewId = null; renderSelected(); updateMarkerStates(); tt.style('opacity',0); })
+    .on('click',      (ev,d) => { lockedId = (lockedId === d.id) ? null : d.id; renderSelected(ev); updateMarkerStates(); ev.stopPropagation(); });
+
+  markers.append('circle').attr('r',6).attr('fill','#4dabf7');
+  markers.append('text').attr('y',-10).attr('text-anchor','middle').text(d=>d.name);
+
+  // Click empty map area clears lock
+  mapSvg.on('click', (ev) => {
+    if (ev.target === mapSvg.node()) {
+      lockedId = null;
+      renderSelected();
+      updateMarkerStates();
+    }
+  });
+  // Esc to clear lock
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      lockedId = null;
+      renderSelected();
+      updateMarkerStates();
+    }
+  });
+
+  function updateMarkerStates(){
+    markers
+      .classed('locked', d => lockedId === d.id)
+      .classed('preview', d => previewId === d.id);
+  }
+
+  // ---------- Sliders (styled + constrained) ----------
+  const y0 = document.getElementById('y0');
+  const y1 = document.getElementById('y1');
+  const lab0 = document.getElementById('lab0');
+  const lab1 = document.getElementById('lab1');
+
+  // initialize bounds
+  y0.min = globalMin; y0.max = globalMax-1; // must leave room for Y1
+  y1.min = +y0.value + 1; y1.max = globalMax;
+
+  function clampFromBaseline(){
+    y1.min = +y0.value + 1;
+    if (+y1.value < +y1.min) y1.value = y1.min;
+    y0.max = +y1.value - 1;
+  }
+  function clampFromCompare(){
+    y0.max = +y1.value - 1;
+    if (+y0.value > +y0.max) y0.value = y0.max;
+    y1.min = +y0.value + 1;
+  }
+
+  y0.addEventListener('input', ()=>{ clampFromBaseline(); updateAll(); tt.style('opacity',0); });
+  y1.addEventListener('input', ()=>{ clampFromCompare(); updateAll(); tt.style('opacity',0); });
+
+  // ---------- Update pipeline ----------
+  function updateAll(){
+    const Y0 = +y0.value, Y1 = +y1.value;
+    lab0.textContent = Y0; lab1.textContent = Y1;
+
+    // zoom x-axis to selected range
+    x.domain([Y0, Y1]);
+    xAxisG.call(d3.axisBottom(x).ticks(8).tickFormat(d3.format('d')));
+
+    // compute deltas for current years
+    const deltas = CONT_MARKERS.map(m => {
+      const v0 = tempAt(m.id, Y0), v1 = tempAt(m.id, Y1);
+      return (v1!=null && v0!=null) ? (v1 - v0) : null;
+    }).filter(v => v != null && isFinite(v));
+
+    // robust domain for color/radius
+    let D = d3.max(deltas, d => Math.abs(d)) || 1;
+    if (!isFinite(D) || D < 0.1) D = 0.5; // fallback stability
+
+    color.domain([+D, 0, -D]); // RdBu: red=warm
+    radius.domain([0, D]);
+
+    // color & size markers
+    markers.select('circle')
+      .attr('fill', d=>{
+        const v0 = tempAt(d.id, Y0), v1 = tempAt(d.id, Y1);
+        const delta = (v1!=null && v0!=null) ? (v1 - v0) : 0;
+        return color(delta);
+      })
+      .attr('r', d=>{
+        const v0 = tempAt(d.id, Y0), v1 = tempAt(d.id, Y1);
+        const delta = (v1!=null && v0!=null) ? Math.abs(v1 - v0) : 0;
+        return radius(delta);
+      })
+      .attr('opacity', d=>{
+        const v0 = tempAt(d.id, Y0), v1 = tempAt(d.id, Y1);
+        return (v0==null || v1==null) ? 0.6 : 1;
+      });
+
+    // vertical rule at compare year
+    const Hline = H; yearRule.attr('x1', x(Y1)).attr('x2', x(Y1)).attr('y1',0).attr('y2',Hline);
+
+    // update legend for this Δ range
+    updateLegend(D);
+
+    // refresh chart for current selection (locked/preview or none)
+    renderSelected();
+  }
+
+  function renderSelected(ev){
+    const selId = currentId();
+    const Y0 = +y0.value, Y1 = +y1.value;
+
+    if (!selId){
+      lineLayer.selectAll('path').remove();
+      y.domain([0,1]); // harmless placeholder
+      yAxisG.call(d3.axisLeft(y));
+      gridX.call(d3.axisBottom(x).tickSize(-H).tickFormat(''));
+      gridY.call(d3.axisLeft(y).tickSize(-W).tickFormat(''));
+      title.text(`Hover a continent to see its temperature history (°C) for ${Y0}–${Y1}`);
+      tt.style('opacity',0);
+      return;
+    }
+
+    const full = (merged.get(selId)||[]).slice().sort((a,b)=>d3.ascending(a.year,b.year));
+    const arr = full.filter(d=> d.year>=Y0 && d.year<=Y1);
+    if (!arr.length){
+      lineLayer.selectAll('path').remove();
+      title.text(selId+' — (no data)');
+      tt.style('opacity',0);
+      return;
+    }
+
+    const yDom = d3.extent(arr, d=>d.tas_c);
+    const pad = (yDom[1]-yDom[0]||1)*0.08;
+    y.domain([yDom[0]-pad, yDom[1]+pad]).nice();
+    yAxisG.call(d3.axisLeft(y));
+    gridX.call(d3.axisBottom(x).tickSize(-H).tickFormat(''));
+    gridY.call(d3.axisLeft(y).tickSize(-W).tickFormat(''));
+
+    const L = d3.line().x(d=>x(d.year)).y(d=>y(d.tas_c));
+    lineLayer.selectAll('path').data([arr]).join('path')
+      .attr('fill','none').attr('stroke','#d9480f').attr('stroke-width',2).attr('d', L);
+
+    const a = nearest(full, Y0), b = nearest(full, Y1);
+    const delta = (b?.tas_c ?? 0) - (a?.tas_c ?? 0);
+    title.text(`${selId} — ${a?.year}→${b?.year}: Δ${delta.toFixed(2)} °C (from ${a?.tas_c?.toFixed(2)} to ${b?.tas_c?.toFixed(2)} °C)`);
+
+    if (ev){
+      const pageX = ev.pageX ?? (ev.clientX + window.scrollX);
+      const pageY = ev.pageY ?? (ev.clientY + window.scrollY);
+      tt.html(`<strong>${selId}</strong><br/>Base ${a?.year}: ${a?.tas_c?.toFixed(2)} °C<br/>Comp ${b?.year}: ${b?.tas_c?.toFixed(2)} °C<br/><b>Δ</b> ${delta.toFixed(2)} °C`)
+        .style('opacity',1).style('left',(pageX+10)+"px").style('top',(pageY-10)+"px");
+    } else {
+      tt.style('opacity',0);
+    }
+  }
+
+  // ---------- Init ----------
+  clampFromBaseline();
+  // Set initial axis once
+  xAxisG.call(d3.axisBottom(x).ticks(8).tickFormat(d3.format('d')));
+  updateMarkerStates();
+  updateAll();
+})();
+</script>
+</body>
+</html>
