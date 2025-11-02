@@ -12,7 +12,7 @@
     .sub{color:var(--muted);margin:0 0 18px}
     .wrap{display:grid;grid-template-columns:460px 1fr;gap:16px;align-items:start;margin-top:4px}
 
-    .panel{border:1px solid #0002;border-radius:12px;padding:10px}
+    .panel{border:1px solid #0002;border-radius:12px;padding:10px;position:relative}
     .controls{display:flex;gap:10px;align-items:center;margin:0}
     .pill{border:1px solid #0002;background:#f8f9fa;padding:6px 10px;border-radius:999px}
     .legend{display:flex;gap:8px;align-items:center}
@@ -39,7 +39,6 @@
     output.pill{
       background:#111;color:#fff;border:none;padding:6px 10px;border-radius:999px;font-weight:600;letter-spacing:.2px;
     }
-    .panel{position:relative}
 
     /* Slider row ABOVE the map, centered, fixed height to match chart exactly */
     .controls--top{
@@ -52,6 +51,9 @@
     /* Marker states */
     .marker.locked circle{stroke:#000;stroke-width:2}
     .marker.preview:not(.locked) circle{stroke:#000a;stroke-dasharray:2 2}
+
+    /* Optional tiny tweak for ocean label tone */
+    .marker.ocean text{fill:#065f46}
   </style>
 </head>
 <body>
@@ -90,52 +92,69 @@
 <script>
 (async function(){
 
-  // ---------- Load ----------
-  const rows = await d3.csv('../data/cmip6_tas_pr_regions.csv', d3.autoType);
+  // --- Load continents + ocean basins and merge, preferring ssp585 per (region, year) ---
+  const [landRows, seaRows] = await Promise.all([
+    d3.csv('data/cmip6_continents_tas_pr_1980_2100.csv', d3.autoType),
+    d3.csv('data/cmip6_ocean_basin_anomaly_1980_2100.csv', d3.autoType)
+  ]);
 
+  // normalize ocean column name if needed
+  seaRows.forEach(d => { if (d.tos_anomaly != null && d.tas_anomaly == null) d.tas_anomaly = d.tos_anomaly; });
+
+  const rows = landRows.concat(seaRows);
+
+  // keep only historical + ssp585
   const keep = rows.filter(d => {
     const s = String(d.scenario||'').toLowerCase();
     return s === 'historical' || s === 'ssp585';
   });
 
-  // Prefer SSP585 when both present for a (region, year)
-  const byKey = d3.group(keep, d => `${d.region}|${d.year}`);
+  // prefer ssp585 where both exist for (region, year)
+  const byKey = d3.group(keep, d => `${String(d.region).toLowerCase()}|${+d.year}`);
   const stitched = [];
   for (const [, arr] of byKey) {
     const pick = arr.find(d => String(d.scenario).toLowerCase()==='ssp585') || arr[0];
     stitched.push(pick);
   }
 
-  let data = stitched.filter(d => d.year >= 1980 && d.year <= 2100);
-
-  // Rebase to 1980 per region
-  const seriesByRegionRaw = d3.group(data, d => d.region);
-  const rebased = [];
-  for (const [region, arr] of seriesByRegionRaw.entries()) {
-    const sorted = arr.slice().sort((a,b)=>d3.ascending(a.year,b.year));
-    const y1980 = sorted.find(d => d.year === 1980);
-    if (!y1980) continue;
-    const base = y1980.tas_anomaly;
-    for (const r of sorted) rebased.push({ region, year:r.year, since1980:r.tas_anomaly - base });
-  }
-  data = rebased;
+  // Build the series the chart expects (continents + oceans together)
+  let data = stitched
+    .filter(d => d.year >= 1980 && d.year <= 2100)
+    .map(d => ({
+      region: String(d.region).toLowerCase(),
+      year: +d.year,
+      since1980: +d.tas_anomaly
+    }));
 
   const seriesByRegion = d3.group(data, d => d.region);
   const years = d3.extent(data, d => d.year);
 
   // Regions (ids must match CSV's "region" column)
   const REGIONS = [
-    {id:'alaska',   name:'Alaska', lon:-150, lat:64},
-    {id:'ca_coast', name:'CA',     lon:-122, lat:37},
-    {id:'usa',      name:'USA',    lon:-98,  lat:39},
-    {id:'europe',   name:'Europe', lon:10,   lat:50},
-    {id:'global',   name:'Global', lon:0,    lat:0}
+    { id:'africa',         name:'Africa',         lon: 20,  lat:  5 },
+    { id:'asia',           name:'Asia',           lon:100,  lat: 30 },
+    { id:'europe',         name:'Europe',         lon: 10,  lat: 50 },
+    { id:'north_america',  name:'North America',  lon:-100, lat: 45 },
+    { id:'south_america',  name:'South America',  lon:-60,  lat:-15 },
+    { id:'oceania',        name:'Oceania',        lon:135,  lat:-25 },
+  ];
+
+  // Ocean basins (IDs must match the 'region' strings in the ocean CSV)
+  const OCEANS = [
+    { id:'pacific_north',  name:'North Pacific',  lon:-160, lat:  30 },
+    { id:'pacific_south',  name:'South Pacific',  lon:-140, lat: -25 },
+    { id:'atlantic_north', name:'North Atlantic', lon: -40, lat:  35 },
+    { id:'atlantic_south', name:'South Atlantic', lon: -20, lat: -30 },
+    { id:'indian',         name:'Indian Ocean',   lon:  80, lat: -20 },
+    { id:'southern',       name:'Southern Ocean', lon:   0, lat: -60 },
+    { id:'arctic',         name:'Arctic Ocean',   lon:   0, lat:  80 },
   ];
 
   // --- Interaction state ---
-  let lockedRegionId  = 'global'; // start locked on Global
+  let lockedRegionId  = 'north_america';
   let previewRegionId = null;
-  const currentRegionId = () => (lockedRegionId ?? previewRegionId);
+  // Hover (preview) takes priority over locked selection
+  const currentRegionId = () => (previewRegionId ?? lockedRegionId);
 
   // Map
   const mapSvg = d3.select('#map');
@@ -144,8 +163,8 @@
   const land = topojson.feature(world, world.objects.countries);
   const projection = d3.geoNaturalEarth1().fitExtent([[8,8],[widthM-8,heightM-8]], {type:"Sphere"});
   const path = d3.geoPath(projection);
-  mapSvg.append('path').attr('d', path({type:'Sphere'})).attr('fill','#f1f3f5');  /* <-- fixed */
-  mapSvg.append('path').attr('d', path(land)).attr('fill','#dee2e6').attr('stroke','#adb5bd').attr('stroke-width',0.5); /* <-- fixed */
+  mapSvg.append('path').attr('d', path({type:'Sphere'})).attr('fill','#f1f3f5');
+  mapSvg.append('path').attr('d', path(land)).attr('fill','#dee2e6').attr('stroke','#adb5bd').attr('stroke-width',0.5);
 
   const vExtent = d3.extent(data, d => d.since1980);
   const color = d3.scaleSequential(d3.interpolateRdYlBu).domain([vExtent[1], vExtent[0]]);
@@ -155,7 +174,7 @@
   const yearLab = document.getElementById('yearLab');
   yearInput.min = Math.max(1980, years[0]);
   yearInput.max = Math.min(2100, years[1]);
-  yearInput.value = Math.max(2000, +yearInput.min);
+  yearInput.value = Math.max(1980, +yearInput.min);
   yearLab.textContent = yearInput.value;
 
   const markers = mapSvg.append('g').selectAll('.marker').data(REGIONS).join('g')
@@ -168,6 +187,18 @@
 
   markers.append('circle').attr('r',6).attr('fill','#4dabf7');
   markers.append('text').attr('y',-10).attr('text-anchor','middle').text(d=>d.name);
+
+  // Oceans layer (same interactions)
+  const oceanMarkers = mapSvg.append('g').selectAll('.marker.ocean').data(OCEANS).join('g')
+    .attr('class','marker ocean')
+    .attr('transform', d=>`translate(${projection([d.lon,d.lat])})`)
+    .on('mouseenter', (ev,d) => { previewRegionId = d.id; renderSelected(ev); updateMarkerStyles(); })
+    .on('mousemove',  (ev,d) => { previewRegionId = d.id; renderSelected(ev); updateMarkerStyles(); })
+    .on('mouseleave', () => { previewRegionId = null; renderSelected(); updateMarkerStyles(); d3.select('#tt').style('opacity',0); })
+    .on('click',      (ev,d) => { lockedRegionId = (lockedRegionId === d.id) ? null : d.id; renderSelected(ev); updateMarkerStyles(); });
+
+  oceanMarkers.append('circle').attr('r',6).attr('fill','#0ca678');
+  oceanMarkers.append('text').attr('y',-10).attr('text-anchor','middle').text(d=>d.name);
 
   // Click empty map area to clear lock
   mapSvg.on('click', (ev) => {
@@ -215,13 +246,14 @@
   const W = 560 - margin.left - margin.right;
   const H = 420 - margin.top - margin.bottom;
   const g = chartSvg.append('g').attr('transform',`translate(${margin.left},${margin.top})`);
-  const x = d3.scaleLinear().domain([+yearInput.min, +yearInput.max]).range([0,W]);
+  const x = d3.scaleLinear().range([0,W]);
   const y = d3.scaleLinear().range([H,0]);
-  const xAxis = d3.axisBottom(x).ticks(8).tickFormat(d3.format('d'));
+
+  // We'll control tickValues ourselves (to avoid duplicates at 2100)
+  const xAxisG = g.append('g').attr('class','x axis').attr('transform',`translate(0,${H})`);
   const yAxis = d3.axisLeft(y);
   g.append('g').attr('class','x grid').attr('transform',`translate(0,${H})`);
   g.append('g').attr('class','y grid');
-  g.append('g').attr('class','x axis').attr('transform',`translate(0,${H})`).call(xAxis);
   g.append('g').attr('class','y axis').call(yAxis);
   g.append('text').attr('class','axislabel').attr('x', W/2).attr('y', H+34).attr('text-anchor','middle').text('Year');
   g.append('text').attr('class','axislabel').attr('x', -H/2).attr('y', -40).attr('transform','rotate(-90)').attr('text-anchor','middle').text('Warming since 1980 (°C)');
@@ -229,26 +261,24 @@
   const yearRule = g.append('line').attr('stroke','#0005');
   const title = chartSvg.append('text').attr('x', margin.left).attr('y', 16).attr('font-size','14px');
 
-  // ---------- Fixed, top-centered annotations ----------
- // ---------- Fixed, top-centered annotations ----------
-  const CURRENT_YEAR = new Date().getFullYear(); // viewer's clock
+  // ---------- Fixed annotations ----------
+  const yearInputMax = +yearInput.max;
+  const BASE_YEAR   = +yearInput.min;   // 1980 from your CSV
+  const CURRENT_YEAR = new Date().getFullYear();
   const STITCH_YEAR  = 2015;
-  const THRESH_VAL   = 1.5; // °C since 1980
-  const END_YEAR     = Math.min(2100, +yearInput.max); // usually 2100
-  // °C since 1980
+  const THRESH_VAL   = 1.5;
+  const END_YEAR     = Math.min(2100, yearInputMax);
 
   const annoLayer = g.append('g').attr('class','anno-top').style('pointer-events','none');
 
-  // Callout tunables
-  const ANNO_MAX_W = 360;   // width cap so long text still fits
+  const ANNO_MAX_W = 360;
   const PAD_X = 10;
   const PAD_Y = 8;
-  const STACK_GAP = 8;       // gap between stacked callouts
-  const TOP_GAP = 6;         // space below the top margin inside the plot
+  const STACK_GAP = 8;
+  const TOP_GAP = 6;
 
   const clamp = (v,min,max)=>Math.max(min,Math.min(max,v));
 
-  // word-wrap helper
   function wrapText(textSel, maxWidth){
     textSel.each(function() {
       const text = d3.select(this);
@@ -273,11 +303,9 @@
     });
   }
 
-  // Draw one centered callout at y = cursorY; returns the used height (including padding)
   function drawCenteredCallout(group, msg, cursorY){
     const gBox = group.append('g').attr('opacity',0);
 
-    // text (measure + wrap)
     const txt = gBox.append('text').attr('x',0).attr('y',0).attr('font-size',12).attr('fill','#111').attr('text-anchor','start').text(msg);
     wrapText(txt, ANNO_MAX_W);
     const bb = txt.node().getBBox();
@@ -288,23 +316,20 @@
     const boxX = clamp(cx - boxW/2, 0, Math.max(0, W - boxW));
     const boxY = clamp(cursorY, 0, Math.max(0, H - boxH));
 
-    // background
     gBox.insert('rect','text')
       .attr('x',boxX).attr('y',boxY)
       .attr('rx',6).attr('ry',6)
       .attr('width',boxW).attr('height',boxH)
       .attr('fill','#fff').attr('stroke','#0002').attr('opacity',0.96);
 
-    // place text inside with padding (adjust for bbox y offset)
     txt.attr('transform', `translate(${boxX + PAD_X}, ${boxY + PAD_Y - bb.y})`);
 
-    // fade in
     gBox.transition().duration(150).attr('opacity',1);
 
     return boxH;
   }
 
-  // Precompute the +1.5°C crossing year per region (first year >= THRESH_VAL)
+  // Precompute the +1.5°C crossing year per region
   const threshYearByRegion = new Map();
   for (const [region, arr] of seriesByRegion.entries()){
     const sorted = arr.slice().sort((a,b)=>a.year-b.year);
@@ -313,38 +338,32 @@
   }
 
   function friendly(id){
-    const m = {alaska:'Alaska',ca_coast:'California Coast',usa:'USA',europe:'Europe',global:'Global'};
-    return m[id]||id;
+    const r = REGIONS.find(r => r.id === id) || OCEANS.find(o => o.id === id);
+    return r ? r.name : id;
   }
   function findRecord(regionId, yv){
     const arr = seriesByRegion.get(regionId) || [];
     return arr.find(r => r.year === +yv);
   }
 
-  // Update all (stacked) top-centered annotations for a given year
   function updateTopCenteredAnnotations(yNum){
     annoLayer.selectAll('*').remove();
 
     const msgs = [];
     const regionId = currentRegionId();
 
-    // 1) Current-year
     if (yNum === CURRENT_YEAR && regionId){
       const rec = findRecord(regionId, yNum);
       if (rec){
         msgs.push(`you have reached the current year, where the temperature has gone up ${rec.since1980.toFixed(2)} degrees celsius since 1980`);
       }
     }
-
-    // 2) Stitch-year (2015)
     if (yNum === STITCH_YEAR && regionId){
       const rec = findRecord(regionId, yNum);
       if (rec){
         msgs.push('2015: transition from historical data to SSP5-8.5 projections');
       }
     }
-
-    // 3) Threshold (+1.5 °C since 1980) — first crossing year for the region
     if (regionId){
       const tYear = threshYearByRegion.get(regionId);
       if (tYear != null && yNum === tYear){
@@ -358,8 +377,7 @@
       }
     }
 
-    // Render stacked
-    let cursorY = TOP_GAP; // distance from top inside the plot area
+    let cursorY = TOP_GAP;
     msgs.forEach(msg => {
       const usedH = drawCenteredCallout(annoLayer, msg, cursorY);
       cursorY += usedH + STACK_GAP;
@@ -368,7 +386,7 @@
 
   // Marker visual + color/size by current year
   function updateMarkersForYear(yNum){
-    markers.select('circle')
+    const paint = sel => sel
       .attr('fill', d => {
         const rec = findRecord(d.id, yNum);
         const val = rec ? rec.since1980 : null;
@@ -380,24 +398,57 @@
         const val = rec ? Math.abs(rec.since1980) : 0;
         return radius(val);
       });
+
+    paint(markers.select('circle'));
+    paint(oceanMarkers.select('circle'));
   }
 
   function updateMarkerStyles(){
     markers
       .classed('locked', d => lockedRegionId === d.id)
       .classed('preview', d => previewRegionId === d.id);
+    oceanMarkers
+      .classed('locked', d => lockedRegionId === d.id)
+      .classed('preview', d => previewRegionId === d.id);
+  }
+
+  // ---- integer ticks (avoid duplicate 2099/2100 at the end) ----
+  function integerTicks(start, end, maxTicks=8){
+    const span = end - start;
+    if (span <= 3) {
+      return d3.range(Math.floor(start), Math.floor(end)+1, 1)
+               .filter(v => v >= start && v <= end);
+    }
+    const step = Math.max(1, Math.ceil(span / maxTicks));
+    const first = Math.ceil(start / step) * step;
+    const vals = [];
+    for (let v = first; v <= end; v += step) vals.push(v);
+    if (vals[vals.length-1] !== end) vals.push(end);
+    return [...new Set(vals)];
+  }
+
+  // ---- Fixed x-axis: 1980 → 2100 ----
+  function updateXDomain(){
+    const start = BASE_YEAR;           // 1980
+    const end   = +yearInput.max;      // 2100
+    x.domain([start, end]);
+
+    const ticks = integerTicks(start, end, 8);
+    xAxisG.call(d3.axisBottom(x).tickValues(ticks).tickFormat(d3.format('d')));
+    g.select('.x.grid').call(d3.axisBottom(x).tickValues(ticks).tickSize(-H).tickFormat(''));
   }
 
   function setYear(yv){
     const yNum = +yv;
     yearLab.textContent = yNum;
+
+    updateXDomain(); // fixed domain
+
     updateMarkersForYear(yNum);
     yearRule.attr('x1', x(yNum)).attr('x2', x(yNum)).attr('y1',0).attr('y2',H);
 
-    // Ensure the y-scale & line match the active region before annotations
     renderSelected();
 
-    // Top-centered annotations
     updateTopCenteredAnnotations(yNum);
   }
 
@@ -413,7 +464,10 @@
       return;
     }
 
-    const arr = (seriesByRegion.get(regionId)||[]).slice().sort((a,b)=>d3.ascending(a.year,b.year));
+    const domainStart = x.domain()[0];
+    const arrAll = (seriesByRegion.get(regionId)||[]).slice().sort((a,b)=>d3.ascending(a.year,b.year));
+    const arr = arrAll.filter(d => d.year >= domainStart);
+
     if (!arr.length){
       lineLayer.selectAll('path').remove();
       title.text(friendly(regionId)+' — (no data)');
@@ -425,7 +479,6 @@
     const yDom = d3.extent(arr, d=>d.since1980);
     const pad = (yDom[1]-yDom[0]||1)*0.08; y.domain([yDom[0]-pad, yDom[1]+pad]).nice();
     g.select('.y.axis').call(yAxis);
-    g.select('.x.grid').call(d3.axisBottom(x).tickSize(-H).tickFormat(''));
     g.select('.y.grid').call(d3.axisLeft(y).tickSize(-W).tickFormat(''));
 
     const line = d3.line().x(d=>x(d.year)).y(d=>y(d.since1980));
@@ -433,7 +486,7 @@
       .attr('fill','none').attr('stroke','#d9480f').attr('stroke-width',2).attr('d', line);
 
     const yv = +yearInput.value;
-    const atYear = arr.find(d => d.year === yv);
+    const atYear = arrAll.find(d => d.year === yv);
     const txt = atYear ? `Year ${yv}: +${atYear.since1980.toFixed(2)}°C since 1980` : `Year ${yv}: (no value)`;
     title.text(friendly(regionId) + ' — Warming since 1980 (°C)');
 
@@ -446,7 +499,6 @@
       tt.style('opacity',0);
     }
 
-    // Re-render top-centered annotations after y-domain updates
     updateTopCenteredAnnotations(yv);
   }
 
@@ -455,6 +507,7 @@
 
   // init
   updateMarkerStyles();
+  updateXDomain();
   setYear(yearInput.value);
 
 })();
